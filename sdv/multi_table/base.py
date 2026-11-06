@@ -1,0 +1,1070 @@
+"""Base Multi Table Synthesizer class."""
+
+import contextlib
+import datetime
+import inspect
+import json
+import operator
+import warnings
+from collections import defaultdict
+from copy import deepcopy
+from pathlib import Path
+
+import cloudpickle
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+from sdv import version
+from sdv._utils import (
+    _metadata_range_exceeds_real,
+    _validate_positive_integer,
+    check_synthesizer_version,
+    generate_synthesizer_id,
+)
+from sdv.cag._errors import ConstraintNotMetError
+from sdv.cag._utils import (
+    _convert_to_snake_case,
+    _get_invalid_rows,
+    _validate_constraints,
+)
+from sdv.cag.programmable_constraint import ProgrammableConstraint, ProgrammableConstraintHarness
+from sdv.errors import (
+    InvalidDataError,
+    RefitWarning,
+    SamplingError,
+    SynthesizerInputError,
+)
+from sdv.logging import disable_single_table_logger, get_sdv_logger
+from sdv.metadata.metadata import Metadata
+from sdv.single_table.copulas import GaussianCopulaSynthesizer
+from sdv.single_table.utils import validate_folder_path_with_table_names
+
+SYNTHESIZER_LOGGER = get_sdv_logger('MultiTableSynthesizer')
+
+
+class BaseMultiTableSynthesizer:
+    """Base class for multi table synthesizers.
+
+    The ``BaseMultiTableSynthesizer`` class defines the common API that all the
+    multi table synthesizers need to implement, as well as common functionality.
+
+    Args:
+        metadata (sdv.Metadata):
+            Multi table metadata representing the data tables that this synthesizer will be used
+            for.
+        locales (list or str):
+            The default locale(s) to use for AnonymizedFaker transformers.
+            Defaults to ``['en_US']``.
+        verbose (bool):
+            Whether to print progress for fitting or not.
+    """
+
+    DEFAULT_SYNTHESIZER_KWARGS = None
+    _synthesizer = GaussianCopulaSynthesizer
+    _numpy_seed = 73251
+
+    @contextlib.contextmanager
+    def _set_temp_numpy_seed(self):
+        initial_state = np.random.get_state()
+        if isinstance(self._numpy_seed, int):
+            np.random.seed(self._numpy_seed)
+            np.random.default_rng(self._numpy_seed)
+        else:
+            np.random.set_state(self._numpy_seed)
+            np.random.default_rng(self._numpy_seed[1])
+        try:
+            yield
+        finally:
+            self._numpy_seed = np.random.get_state()
+            np.random.set_state(initial_state)
+
+    def _initialize_models(self):
+        with disable_single_table_logger():
+            for table_name, table_metadata in self._modified_multi_table_metadata.tables.items():
+                synthesizer_parameters = {'locales': self.locales}
+                synthesizer_parameters.update(self._table_parameters.get(table_name, {}))
+                metadata_dict = {'tables': {table_name: table_metadata.to_dict()}}
+                metadata = Metadata.load_from_dict(metadata_dict)
+                self._table_synthesizers[table_name] = self._synthesizer(
+                    metadata=metadata, **synthesizer_parameters
+                )
+                # Mark synthesizer as embedded in a multi-table setting
+                # so it can suppres datetime_format warnings that are aggregated here
+                self._table_synthesizers[table_name]._suppress_datetime_format_warning = True
+                self._table_synthesizers[table_name]._data_processor.table_name = table_name
+
+    def _get_pbar_args(self, **kwargs):
+        """Return a dictionary with the updated keyword args for a progress bar."""
+        pbar_args = {'disable': not self.verbose}
+        pbar_args.update(kwargs)
+
+        return pbar_args
+
+    def _print(self, text='', **kwargs):
+        if self.verbose:
+            print(text, **kwargs)  # noqa: T201
+
+    def _check_metadata_updated(self):
+        if self.metadata._check_updated_flag():
+            self.metadata._reset_updated_flag()
+            warnings.warn(
+                "We strongly recommend saving the metadata using 'save_to_json' for replicability"
+                ' in future SDV versions.'
+            )
+
+    def _handle_composite_keys(self):
+        """Validates that composite keys are not used in Public SDV."""
+        composite_key_tables = []
+        for table, table_metadata in self.metadata.tables.items():
+            if table_metadata._primary_key_is_composite:
+                composite_key_tables.append(table)
+
+        if composite_key_tables:
+            raise SynthesizerInputError(
+                'Your metadata contains composite keys (primary key of tables '
+                f'{composite_key_tables} have multiple columns). Composite keys are '
+                'not supported in SDV Community.'
+            )
+
+    def _validate_schema_complexity(self):
+        """Implement this function for slow synthesizers."""
+        pass
+
+    def __init__(self, metadata, locales=['en_US']):
+        self.metadata = metadata
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message=r'.*column relationship.*')
+            self.metadata.validate()
+
+        self._validate_schema_complexity()
+        self._check_metadata_updated()
+        self._original_metadata = deepcopy(self.metadata)
+        self._modified_multi_table_metadata = deepcopy(self.metadata)
+        self._composite_keys_metadata = None
+        self._handle_composite_keys()
+        self.locales = locales
+        self.verbose = False
+        self.extended_columns = defaultdict(dict)
+        self._table_synthesizers = {}
+        self._table_parameters = defaultdict(dict)
+        self._original_table_columns = {}
+        self.constraints = []
+        self._single_table_constraints = []
+        if self.DEFAULT_SYNTHESIZER_KWARGS:
+            for table_name in self.metadata.tables:
+                self._table_parameters[table_name] = deepcopy(self.DEFAULT_SYNTHESIZER_KWARGS)
+
+        self._initialize_models()
+        self._fitted = False
+        self._constraints_fitted = False
+        self._creation_date = datetime.datetime.today().strftime('%Y-%m-%d')
+        self._fitted_date = None
+        self._fitted_sdv_version = None
+        self._fitted_sdv_enterprise_version = None
+        self._synthesizer_id = generate_synthesizer_id(self)
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Instance',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': self._synthesizer_id,
+        })
+
+    def set_address_columns(self, table_name, column_names, anonymization_level='full'):
+        """Set the address multi-column transformer.
+
+        Args:
+            table_name (str):
+                The name of the table for which the address transformer should be set.
+            column_names (tuple[str]):
+                The column names to be used for the address transformer.
+            anonymization_level (str):
+                The anonymization level to use for the address transformer.
+        """
+        self._validate_table_name(table_name)
+        self._table_synthesizers[table_name].set_address_columns(column_names, anonymization_level)
+
+    def _detect_single_table_constraints(self, constraints):
+        """Filter out single table constraints from the list of constraints.
+
+        Args:
+            constraints (list):
+                A list of constraints to filter.
+        """
+        has_seen_single_table_constraint = len(self._single_table_constraints) > 0
+        idx_single_table_constraint = 0 if has_seen_single_table_constraint else None
+        for idx, constraint in enumerate(constraints):
+            if has_seen_single_table_constraint and constraint._is_single_table is False:
+                raise SynthesizerInputError(
+                    'Cannot apply multi-table constraint after single-table constraint has '
+                    'been applied.'
+                )
+
+            if not constraint._is_single_table:
+                continue
+
+            if not has_seen_single_table_constraint:
+                has_seen_single_table_constraint = True
+                idx_single_table_constraint = idx
+
+        return idx_single_table_constraint
+
+    def _validate_single_table_constraints(self, constraints):
+        for constraint in constraints:
+            if getattr(constraint, 'table_name') is None:
+                raise SynthesizerInputError(
+                    f"The '{constraint.__class__.__name__}' is missing the required parameter "
+                    "'table_name'. Please add this parameter to your constraint definition."
+                )
+
+    def add_constraints(self, constraints):
+        """Add the list of constraint-augmented generation constraints to the synthesizer.
+
+        Args:
+            constraints (list):
+                A list of constraints to apply to the synthesizer.
+        """
+        constraints = _validate_constraints(constraints, self._fitted)
+        metadata = self.metadata
+        if self._composite_keys_metadata is not None:
+            metadata = self._composite_keys_metadata
+            self._modified_multi_table_metadata = self._composite_keys_metadata
+
+        multi_table_constraints = []
+        single_table_constraints = []
+        idx_single_table_constraint = self._detect_single_table_constraints(constraints)
+        for idx, constraint in enumerate(constraints):
+            if isinstance(constraint, ProgrammableConstraint):
+                constraint = ProgrammableConstraintHarness(constraint)
+
+            if idx_single_table_constraint is not None and idx >= idx_single_table_constraint:
+                single_table_constraints.append(constraint)
+                continue
+
+            multi_table_constraints.append(constraint)
+            metadata = constraint.get_updated_metadata(metadata)
+            self._modified_multi_table_metadata = metadata
+
+        self.metadata = metadata
+        self._composite_key = None
+        self._handle_composite_keys()
+
+        self._validate_single_table_constraints(single_table_constraints)
+        self.constraints += multi_table_constraints
+        self._constraints_fitted = False
+        self._initialize_models()
+        if self._single_table_constraints or single_table_constraints:
+            for constraint in [*self._single_table_constraints, *single_table_constraints]:
+                table_name = constraint.table_name
+                self._table_synthesizers[table_name].add_constraints([constraint])
+                try:
+                    self.metadata = constraint.get_updated_metadata(self.metadata)
+                except ConstraintNotMetError:
+                    constraint.get_updated_metadata(self._modified_multi_table_metadata)
+
+        self._single_table_constraints += single_table_constraints
+
+    def _get_all_constraints_list(self):
+        if not hasattr(self, 'constraints'):
+            return []
+        constraints = []
+        for constraint in self.constraints:
+            if isinstance(constraint, ProgrammableConstraintHarness):
+                constraints.append(deepcopy(constraint.programmable_constraint))
+            else:
+                constraints.append(deepcopy(constraint))
+
+        for table_name, synthesizer in self._table_synthesizers.items():
+            constraints += synthesizer.get_constraints()
+
+        return constraints
+
+    def get_constraints(self, filepath=None):
+        """Get a list of constraint-augmented generation constraints applied to the synthesizer.
+
+        If `filepath` is provided, will save the constraints in JSON format to `filepath`.
+        Otherwise, will return a list of the constraints applied to the synthesizer.
+
+        Args:
+            filepath (str, optional):
+                Path where the constraints applied to the synthesizer will be serialized. If `None`,
+                will return a list of the applied constraints instead. Defaults to `None`.
+        """
+        constraints = self._get_all_constraints_list()
+        if filepath is None:
+            return constraints
+
+        path = Path(filepath)
+        if path.exists():
+            raise ValueError(
+                f"Cannot save constraints to file because '{filepath}' already exists."
+            )
+
+        constraints_dict_list = [constraint.get_constraint_dict() for constraint in constraints]
+        with open(path, 'w') as file:
+            json.dump(constraints_dict_list, file, indent=4)
+
+    def validate_constraints(self, synthetic_data):
+        """Validate synthetic_data against the constraints.
+
+        Args:
+            data (dict[str, pd.DataFrame]): The synthetic data to validate
+
+        Raises:
+            ConstraintNotMetError:
+                Raised if synthetic data does not match constraints.
+        """
+        transformed_data = synthetic_data
+        for constraint in self.constraints:
+            valid_data = constraint.is_valid(data=transformed_data)
+            for table_name, valid_table in valid_data.items():
+                if not valid_table.all():
+                    invalid_rows_str = _get_invalid_rows(valid_table)
+                    constraint_name = _convert_to_snake_case(constraint.__class__.__name__)
+                    constraint_name = constraint_name.replace('_', ' ')
+                    msg = f"Table '{table_name}': The {constraint_name} requirement is not met "
+                    msg += f'for row indices: {invalid_rows_str}.'
+                    raise ConstraintNotMetError(msg)
+
+            transformed_data = constraint.transform(data=transformed_data)
+
+        for table_name, table_data in transformed_data.items():
+            synthesizer = self._table_synthesizers[table_name]
+            try:
+                synthesizer.validate_constraints(table_data)
+            except ConstraintNotMetError as error:
+                raise ConstraintNotMetError(f"Table '{table_name}': {error}") from error
+
+    def get_metadata(self, version='original'):
+        """Get the metadata, either original or modified after applying constraints.
+
+        Args:
+            version (str, optional):
+                The version of metadata to return, must be one of 'original' or 'modified'. If
+                'original', will return the original metadata used to instantiate the
+                synthesizer. If 'modified', will return the modified metadata after applying this
+                synthesizer's constraints. Defaults to 'original'.
+        """
+        if version not in ('original', 'modified'):
+            error_msg = f"Unrecognized version '{version}', please use 'original' or 'modified'."
+            raise ValueError(error_msg)
+
+        if version == 'original' and hasattr(self, '_original_metadata'):
+            return Metadata.load_from_dict(self._original_metadata.to_dict())
+
+        return Metadata.load_from_dict(self.metadata.to_dict())
+
+    def _validate_transform_constraints(self, data, enforce_constraint_fitting=False):
+        """Validate and transform all constraints during preprocessing.
+
+        Args:
+            data (dict[str, pd.DataFrame]):
+                The data dictionary.
+            enforce_constraint_fitting (bool):
+                Whether to enforce fitting the constraints again. If set to ``True``, the
+                constraints will be fitted again even if they have already been fitted.
+                Defaults to ``False``.
+        """
+        if self._constraints_fitted and not enforce_constraint_fitting:
+            for constraint in self.constraints:
+                data = constraint.transform(data)
+
+            return data
+
+        metadata = self._original_metadata
+        for constraint in self.constraints:
+            constraint.fit(data=data, metadata=metadata)
+            metadata = constraint.get_updated_metadata(metadata)
+            data = constraint.transform(data)
+
+        self._constraints_fitted = True
+        return data
+
+    def _reverse_transform_constraints(self, sampled_data):
+        """Reverse transform constraints after sampling."""
+        if getattr(self, '_composite_keys', None):
+            sampled_data = self._composite_keys.reverse_transform(sampled_data)
+
+        if not hasattr(self, 'constraints'):
+            return sampled_data
+
+        for constraint in reversed(self.constraints):
+            sampled_data = constraint.reverse_transform(sampled_data)
+
+        from sdv.utils.utils import (
+            drop_unknown_references,  # noqa: F401 Lazy import to fix circular dependency
+        )
+
+        # issue
+        sampled_data = drop_unknown_references(sampled_data, self._original_metadata, verbose=False)
+        return sampled_data
+
+    def get_table_parameters(self, table_name):
+        """Return the parameters for the given table's synthesizer.
+
+        Args:
+            table_name (str):
+                Table name for which the parameters should be retrieved.
+
+        Returns:
+            parameters (dict):
+                A dictionary with the following structure:
+                {
+                    'synthesizer_name': the string name of the synthesizer for that table,
+                    'synthesizer_parameters': the parameters used to instantiate the synthesizer
+                }
+        """
+        table_synthesizer = self._table_synthesizers.get(table_name)
+        if not table_synthesizer:
+            table_params = {'synthesizer_name': None, 'synthesizer_parameters': {}}
+        else:
+            table_params = {
+                'synthesizer_name': type(table_synthesizer).__name__,
+                'synthesizer_parameters': table_synthesizer.get_parameters(),
+            }
+
+        return table_params
+
+    def get_parameters(self):
+        """Return the parameters used to instantiate the synthesizer and all table synthesizers.
+
+        Returns:
+            parameters (dict):
+                A dictionary representing the parameters used to instantiate the synthesizer.
+        """
+        parameters = inspect.signature(self.__init__).parameters
+        instantiated_parameters = {}
+        for parameter_name in parameters:
+            if parameter_name != 'metadata':
+                instantiated_parameters[parameter_name] = self.__dict__.get(parameter_name)
+
+        return instantiated_parameters
+
+    def set_table_parameters(self, table_name, table_parameters):
+        """Update the table's synthesizer instantiation parameters.
+
+        Args:
+            table_name (str):
+                Table name for which the parameters should be retrieved.
+            table_parameters (dict):
+                A dictionary with the parameters as keys and the values to be used to instantiate
+                the table's synthesizer.
+        """
+        table_metadata = self.metadata.get_table_metadata(table_name)
+        self._table_synthesizers[table_name] = self._synthesizer(
+            metadata=table_metadata, **table_parameters
+        )
+        # Mark synthesizer as embedded in a multi-table setting to avoid duplicate datetime warnings
+        self._table_synthesizers[table_name]._suppress_datetime_format_warning = True
+        self._table_synthesizers[table_name]._data_processor.table_name = table_name
+        self._table_parameters[table_name].update(deepcopy(table_parameters))
+
+    def _validate_all_tables(self, data):
+        """Validate every table of the data has a valid table/metadata pair."""
+        errors = []
+        for table_name, table_data in data.items():
+            try:
+                self._table_synthesizers[table_name].validate({table_name: table_data})
+
+            except InvalidDataError as error:
+                error_msg = f"Table: '{table_name}'"
+                for _error in error.errors:
+                    error_msg += f'\nError: {_error}'
+
+                errors.append(error_msg)
+
+            except ValueError as error:
+                errors.append(str(error))
+
+            except KeyError:
+                continue
+
+        return errors
+
+    def _check_ranges(self, data):
+        if _metadata_range_exceeds_real(data, self._original_metadata):
+            warnings.warn(
+                'The training data does not cover the full range. Synthetic data will be '
+                'based on the training data. To extrapolate ranges for full coverage, '
+                'please use the Targeted Sampling bundle.'
+            )
+
+    def validate(self, data):
+        """Validate the data.
+
+        Validate that the metadata matches the data and that every table's constraints are valid.
+
+        Args:
+            data (dict[str, pd.DataFrame]):
+                A dictionary of table names to pd.DataFrames.
+        """
+        errors = []
+        self._original_metadata.validate_data(data)
+        self._check_ranges(data)
+
+        transformed_data = self._validate_transform_constraints(
+            data,
+            enforce_constraint_fitting=True,
+        )
+        for table_name, table_data in transformed_data.items():
+            if table_name in self._table_synthesizers:
+                errors += self._table_synthesizers[table_name]._validate(table_data)
+
+        if errors:
+            raise InvalidDataError(errors)
+
+    def _validate_table_name(self, table_name):
+        if table_name not in self._table_synthesizers:
+            raise ValueError(
+                'The provided data does not match the metadata:'
+                f"\nTable '{table_name}' is not present in the metadata."
+            )
+
+    def _assign_table_transformers(self, synthesizer, table_name, table_data):
+        """Update the ``synthesizer`` to ignore the foreign keys while preprocessing the data.
+
+        This function iterates through all foreign keys in the table. For each foreign key,
+        if it is not the primary key in the table, then the transformer is set to None (
+        meaning no transformer is assigned).
+        """
+        synthesizer._auto_assign_transformers({table_name: table_data})
+        primary_key = self.metadata.tables[table_name].primary_key
+        foreign_key_columns = self.metadata._get_all_foreign_keys(table_name)
+        column_name_to_transformers = {
+            column_name: None for column_name in foreign_key_columns if column_name != primary_key
+        }
+        synthesizer.update_transformers(column_name_to_transformers)
+
+    def auto_assign_transformers(self, data):
+        """Automatically assign the required transformers for the given data and constraints.
+
+        This method will automatically set a configuration to the ``rdt.HyperTransformer``
+        with the required transformers for the current data.
+
+        Args:
+            data (dict[str, pd.DataFrame]):
+                Mapping of table name to pandas.DataFrame.
+
+        Raises:
+            InvalidDataError:
+                If a table of the data is not present in the metadata.
+        """
+        for table_name, table_data in data.items():
+            self._validate_table_name(table_name)
+            synthesizer = self._table_synthesizers[table_name]
+            synthesizer.validate({table_name: table_data})
+            self._assign_table_transformers(synthesizer, table_name, table_data)
+
+    def get_transformers(self, table_name):
+        """Get a dictionary mapping of ``column_name`` and ``rdt.transformers``.
+
+        A dictionary representing the column names and the transformers that will be used
+        to transform the data.
+
+        Args:
+            table_name (string):
+                The name of the table of which to get the transformers.
+
+        Returns:
+            dict:
+                A dictionary mapping with column names and transformers.
+
+        Raises:
+            ValueError:
+                If ``table_name`` is not present in the metadata.
+        """
+        self._validate_table_name(table_name)
+        return self._table_synthesizers[table_name].get_transformers(table_name=table_name)
+
+    def update_transformers(self, table_name, column_name_to_transformer):
+        """Update any of the transformers assigned to each of the column names.
+
+        Args:
+            table_name (string):
+                The name of the table of which to update the transformers.
+            column_name_to_transformer (dict):
+                Dict mapping column names to transformers to be used for that column.
+
+        Raises:
+            ValueError:
+                If ``table_name`` is not present in the metadata.
+        """
+        self._validate_table_name(table_name)
+        self._table_synthesizers[table_name].update_transformers(
+            column_name_to_transformer, table_name=table_name
+        )
+
+    def _store_and_convert_original_cols(self, data):
+        list_of_changed_tables = []
+        for table, dataframe in data.items():
+            data_columns = dataframe.columns
+            col_name_mapping = {str(col): col for col in data_columns}
+            reverse_col_name_mapping = {col: str(col) for col in data_columns}
+            self._original_table_columns[table] = col_name_mapping
+            dataframe = dataframe.rename(columns=reverse_col_name_mapping)
+            for column in data_columns:
+                if isinstance(column, int):
+                    list_of_changed_tables.append(table)
+                    break
+
+            data[table] = dataframe
+
+        return list_of_changed_tables
+
+    def preprocess(self, data):
+        """Transform the raw data to numerical space.
+
+        Args:
+            data (dict[str, pd.DataFrame]):
+                Dictionary mapping each table name to a ``pandas.DataFrame``.
+
+        Returns:
+            dict:
+                A dictionary with the preprocessed data.
+        """
+        list_of_changed_tables = self._store_and_convert_original_cols(data)
+        self.validate(data)
+        data = self._validate_transform_constraints(data)
+        if getattr(self, '_composite_keys', None):
+            self._composite_keys.fit(data, self._composite_keys_metadata)
+            data = self._composite_keys.transform(data)
+
+        if self._fitted:
+            msg = (
+                'This model has already been fitted. To use the new preprocessed data, '
+                "please refit the model using 'fit' or 'fit_processed_data'."
+            )
+            warnings.warn(msg, RefitWarning)
+
+        processed_data = {}
+        pbar_args = self._get_pbar_args(desc='Preprocess Tables')
+        for table_name, table_data in tqdm(data.items(), **pbar_args):
+            synthesizer = self._table_synthesizers[table_name]
+            self._assign_table_transformers(synthesizer, table_name, table_data)
+            table_data = synthesizer._validate_transform_constraints(table_data)
+            processed_data[table_name] = synthesizer._preprocess(table_data)
+
+        for table in list_of_changed_tables:
+            data[table] = data[table].rename(columns=self._original_table_columns[table])
+
+        return processed_data
+
+    def _model_tables(self, augmented_data):
+        """Model the augmented tables.
+
+        Args:
+            augmented_data (dict):
+                Dictionary mapping each table name to an augmented ``pandas.DataFrame``.
+        """
+        raise NotImplementedError()
+
+    def _augment_tables(self, processed_data):
+        """Augment the processed data.
+
+        Args:
+            processed_data (dict):
+                Dictionary mapping each table name to a preprocessed ``pandas.DataFrame``.
+        """
+        raise NotImplementedError()
+
+    def fit_processed_data(self, processed_data):
+        """Fit this model to the transformed data.
+
+        Args:
+            processed_data (dict):
+                Dictionary mapping each table name to a preprocessed ``pandas.DataFrame``.
+        """
+        total_rows = 0
+        total_columns = 0
+        for table in processed_data.values():
+            total_rows += len(table)
+            total_columns += len(table.columns)
+
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Fit processed data',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': self._synthesizer_id,
+            'TOTAL NUMBER OF TABLES': len(processed_data),
+            'TOTAL NUMBER OF ROWS': total_rows,
+            'TOTAL NUMBER OF COLUMNS': total_columns,
+        })
+
+        check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+        with disable_single_table_logger():
+            augmented_data = self._augment_tables(processed_data)
+            self._model_tables(augmented_data)
+
+        self._fitted = True
+        self._fitted_date = datetime.datetime.today().strftime('%Y-%m-%d')
+        self._fitted_sdv_version = getattr(version, 'community', None)
+        self._fitted_sdv_enterprise_version = getattr(version, 'enterprise', None)
+
+    def fit(self, data):
+        """Fit this model to the original data.
+
+        Args:
+            data (dict):
+                Dictionary mapping each table name to a ``pandas.DataFrame`` in the raw format
+                (before any transformations).
+        """
+        empty_tables = [table_name for table_name, table_data in data.items() if table_data.empty]
+        if empty_tables:
+            raise ValueError(
+                f'The fit dataframe for table(s) {empty_tables} is empty, '
+                'synthesizer will not be fitted.'
+            )
+
+        total_rows = 0
+        total_columns = 0
+        for table in data.values():
+            total_rows += len(table)
+            total_columns += len(table.columns)
+
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Fit',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': self._synthesizer_id,
+            'TOTAL NUMBER OF TABLES': len(data),
+            'TOTAL NUMBER OF ROWS': total_rows,
+            'TOTAL NUMBER OF COLUMNS': total_columns,
+        })
+
+        check_synthesizer_version(self, is_fit_method=True, compare_operator=operator.lt)
+        self._check_metadata_updated()
+        self._fitted = False
+        processed_data = self.preprocess(data)
+        self._print(text='\n', end='')
+        self.fit_processed_data(processed_data)
+
+    def reset_sampling(self):
+        """Reset the sampling to the state that was left right after fitting."""
+        self._numpy_seed = 73251
+        for synthesizer in self._table_synthesizers.values():
+            synthesizer.reset_sampling()
+
+    def _sample(
+        self,
+        scale,
+        batch_size=None,
+        max_tries_per_batch=100,
+    ):
+        raise NotImplementedError()
+
+    def _resolve_scale(self, table_name, num_rows):
+        """Compute the scale based on the requested table size."""
+        return num_rows / self._table_sizes[table_name]
+
+    def _validate_sample_input(
+        self,
+        num_rows,
+        main_table_name,
+        batch_size,
+        max_tries_per_batch,
+        output_folder_path,
+    ):
+        """Validate the inputs for sampling."""
+        if not self._fitted:
+            raise SamplingError(
+                'This synthesizer has not been fitted. Please fit your synthesizer first before '
+                'sampling synthetic data.'
+            )
+
+        if main_table_name is None:
+            raise SynthesizerInputError(
+                '`main_table_name` cannot be None for multi-table sampling. '
+                'Please provide a table name.'
+            )
+
+        table_names = list(self.get_metadata().tables)
+        if main_table_name not in table_names:
+            raise SynthesizerInputError(
+                f"Table '{main_table_name}' does not exist in the metadata."
+            )
+
+        _validate_positive_integer('num_rows', num_rows)
+        _validate_positive_integer('max_tries_per_batch', max_tries_per_batch)
+        if batch_size is not None:
+            _validate_positive_integer('batch_size', batch_size)
+
+        if output_folder_path is not None and (
+            not isinstance(output_folder_path, str) or not output_folder_path
+        ):
+            raise SynthesizerInputError(
+                f"Invalid parameter for 'output_folder_path' ({output_folder_path}). "
+                'Please provide a valid string path.'
+            )
+
+        validate_folder_path_with_table_names(output_folder_path, table_names)
+
+    def _save_sampled_data(self, sampled_data, output_folder_path):
+        output_folder = Path(output_folder_path)
+        for table_name, table_data in sampled_data.items():
+            output_file_path = str(output_folder / f'{table_name}.csv')
+            table_data.to_csv(output_file_path, index=False)
+
+    def _sample_in_batches(
+        self,
+        synthesizer,
+        num_rows,
+        batch_size,
+        max_tries_per_batch,
+    ):
+        if batch_size is None:
+            batch_size = num_rows
+
+        sampled = []
+        remaining_rows = num_rows
+        while remaining_rows:
+            current_batch_size = min(batch_size, remaining_rows)
+            batch = synthesizer._sample_batch(
+                current_batch_size,
+                max_tries=max_tries_per_batch,
+                keep_extra_columns=True,
+            )
+            sampled.append(batch)
+            remaining_rows -= len(batch)
+
+        return pd.concat(sampled, ignore_index=True)
+
+    def _sample_from_scale(self, scale, batch_size, max_tries_per_batch, output_folder_path):
+        with self._set_temp_numpy_seed(), disable_single_table_logger():
+            sampled_data = self._sample(
+                scale=scale,
+                batch_size=batch_size,
+                max_tries_per_batch=max_tries_per_batch,
+            )
+
+        total_rows = 0
+        total_columns = 0
+        for table in sampled_data.values():
+            total_rows += len(table)
+            total_columns += len(table.columns)
+
+        table_columns = getattr(self, '_original_table_columns', {})
+
+        for _table_name in sampled_data:
+            table_data = sampled_data[_table_name][
+                self.get_metadata().get_column_names(_table_name)
+            ]
+
+            if _table_name in table_columns:
+                if isinstance(table_columns[_table_name], dict):
+                    table_data = table_data.rename(columns=table_columns[_table_name])
+                else:
+                    table_data.columns = table_columns[_table_name]
+
+            sampled_data[_table_name] = table_data
+
+        if output_folder_path is not None:
+            self._save_sampled_data(sampled_data, output_folder_path)
+
+        return sampled_data, total_rows, total_columns
+
+    def sample_scale(
+        self,
+        scale=1.0,
+        batch_size=None,
+        max_tries_per_batch=100,
+        output_folder_path=None,
+    ):
+        """Generate synthetic data for the entire dataset.
+
+        Args:
+            scale (float):
+                A float representing how much to scale the data by. If scale is set to ``1.0``,
+                this does not scale the sizes of the tables. If ``scale`` is greater than ``1.0``
+                create more rows than the original data by a factor of ``scale``.
+                If ``scale`` is lower than ``1.0`` create fewer rows by the factor of ``scale``
+                than the original tables. Defaults to ``1.0``.
+            batch_size (int, optional):
+                The batch size for sampling. Defaults to None.
+            max_tries_per_batch (int, optional):
+                The maximum number of tries per batch. Defaults to 100.
+            output_folder_path (str, optional):
+                The folder path to save the sampled data. Defaults to None.
+
+        Returns:
+            dict: A dictionary containing the sampled data for each table.
+        """
+        if not self._fitted:
+            raise SamplingError(
+                'This synthesizer has not been fitted. Please fit your synthesizer first before '
+                'sampling synthetic data.'
+            )
+
+        if type(scale) not in (float, int) or not scale > 0:
+            raise SynthesizerInputError(
+                f"Invalid parameter for 'scale' ({scale}). Please provide a number that is >0.0."
+            )
+        self._validate_sample_input(
+            num_rows=1,
+            main_table_name=list(self.metadata.tables)[0],
+            batch_size=batch_size,
+            max_tries_per_batch=max_tries_per_batch,
+            output_folder_path=output_folder_path,
+        )
+
+        sampled_data, total_rows, total_columns = self._sample_from_scale(
+            scale, batch_size, max_tries_per_batch, output_folder_path
+        )
+
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Sample',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': self._synthesizer_id,
+            'TOTAL NUMBER OF TABLES': len(sampled_data),
+            'TOTAL NUMBER OF ROWS': total_rows,
+            'TOTAL NUMBER OF COLUMNS': total_columns,
+        })
+
+        return sampled_data
+
+    def sample(
+        self,
+        num_rows,
+        main_table_name=None,
+        batch_size=None,
+        max_tries_per_batch=100,
+        output_folder_path=None,
+    ):
+        """Generate synthetic data for the entire dataset.
+
+        Args:
+            num_rows (int):
+                The number of rows to sample.
+            main_table_name (str):
+                The name of the main table to sample.
+            batch_size (int, optional):
+                The batch size for sampling. Defaults to None.
+            max_tries_per_batch (int, optional):
+                The maximum number of tries per batch. Defaults to 100.
+            output_folder_path (str, optional):
+                The folder path to save the sampled data. Defaults to None.
+
+        Returns:
+            dict: A dictionary containing the sampled data for each table.
+        """
+        self._validate_sample_input(
+            num_rows, main_table_name, batch_size, max_tries_per_batch, output_folder_path
+        )
+        scale = self._resolve_scale(main_table_name, num_rows)
+
+        sampled_data, total_rows, total_columns = self._sample_from_scale(
+            scale, batch_size, max_tries_per_batch, output_folder_path
+        )
+
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Sample',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': self._synthesizer_id,
+            'TOTAL NUMBER OF TABLES': len(sampled_data),
+            'TOTAL NUMBER OF ROWS': total_rows,
+            'TOTAL NUMBER OF COLUMNS': total_columns,
+        })
+
+        return sampled_data
+
+    def get_learned_distributions(self, table_name):
+        """Get the marginal distributions used by the ``GaussianCopula`` for a table.
+
+        Return a dictionary mapping the column names with the distribution name and the learned
+        parameters for those.
+
+        Args:
+            table_name (str):
+                Table name for which the parameters should be retrieved.
+
+        Returns:
+            dict:
+                Dictionary containing the distributions used or detected for each column and the
+                learned parameters for those.
+        """
+        synthesizer = self._table_synthesizers[table_name]
+        if hasattr(synthesizer, 'get_learned_distributions'):
+            return synthesizer.get_learned_distributions()
+
+        raise SynthesizerInputError(
+            f"Learned distributions are not available for the '{table_name}' "
+            f"table because it uses the '{synthesizer.__class__.__name__}'."
+        )
+
+    def get_loss_values(self, table_name):
+        """Get the loss values from a model for a table.
+
+        Return a pandas dataframe mapping of the loss values per epoch of GAN
+        based synthesizers
+
+        Args:
+            table_name (str):
+                Table name for which the parameters should be retrieved.
+
+        Returns:
+            pd.DataFrame:
+                Dataframe of loss values per epoch
+        """
+        if table_name not in self._table_synthesizers:
+            raise ValueError(f"Table '{table_name}' is not present in the metadata.")
+
+        synthesizer = self._table_synthesizers[table_name]
+        if hasattr(synthesizer, 'get_loss_values'):
+            return synthesizer.get_loss_values()
+
+        raise SynthesizerInputError(
+            f"Loss values are not available for table '{table_name}' "
+            'because the table does not use a GAN-based model.'
+        )
+
+    def get_info(self):
+        """Get dictionary with information regarding the synthesizer.
+
+        Return:
+            dict:
+                * ``class_name``: synthesizer class name
+                * ``creation_date``: date of creation
+                * ``is_fit``: whether or not the synthesizer has been fit
+                * ``last_fit_date``: date for the last time it was fit
+                * ``fitted_sdv_version``: version of sdv it was on when fitted
+        """
+        info = {
+            'class_name': self.__class__.__name__,
+            'creation_date': self._creation_date,
+            'is_fit': self._fitted,
+            'last_fit_date': self._fitted_date,
+            'fitted_sdv_version': self._fitted_sdv_version,
+        }
+        if self._fitted_sdv_enterprise_version:
+            info['fitted_sdv_enterprise_version'] = self._fitted_sdv_enterprise_version
+
+        return info
+
+    def _validate_fit_before_save(self):
+        """Validate that the synthesizer has been fitted before saving."""
+        if not self._fitted:
+            warnings.warn(
+                'You are saving a synthesizer that has not yet been fitted. You will not be able '
+                'to sample synthetic data without fitting. We recommend fitting the synthesizer '
+                'first and then saving.'
+            )
+
+    def save(self, filepath):
+        """Save this instance to the given path using cloudpickle.
+
+        Args:
+            filepath (str):
+                Path where the instance will be serialized.
+        """
+        self._validate_fit_before_save()
+        synthesizer_id = getattr(self, '_synthesizer_id', None)
+        SYNTHESIZER_LOGGER.info({
+            'EVENT': 'Save',
+            'TIMESTAMP': datetime.datetime.now(),
+            'SYNTHESIZER CLASS NAME': self.__class__.__name__,
+            'SYNTHESIZER ID': synthesizer_id,
+        })
+
+        with open(filepath, 'wb') as output:
+            cloudpickle.dump(self, output)
